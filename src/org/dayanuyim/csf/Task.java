@@ -1,131 +1,157 @@
 package org.dayanuyim.csf;
 
-import java.util.List;
-import java.util.Map;
-
-import javax.jms.Connection;
-import javax.jms.Destination;
 import javax.jms.JMSException;
-import javax.jms.MessageProducer;
-import javax.jms.Session;
-import javax.jms.TextMessage;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.GET;
 import javax.ws.rs.POST;
 import javax.ws.rs.Path;
 import javax.ws.rs.core.MediaType;
 
-import org.apache.activemq.ActiveMQConnectionFactory;
-import org.glassfish.jersey.media.multipart.FormDataBodyPart;
 import org.glassfish.jersey.media.multipart.FormDataMultiPart;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.dayanuyim.utils.Utils.*;
+import static org.apache.commons.lang3.ArrayUtils.*;
+import static org.apache.commons.lang3.StringUtils.*;
+
+enum ServiceStatus {
+	SUCCESS,FAIL,WAITING,ERROR
+}
 
  
 @Path("/task")
 public class Task {
- 
+
+	public static final String AMQ_URI = "failover:(tcp://localhost:61616)?randomize=false";
+	public static final String AMQ_QUEUE = "csfResult";
+	
+	private static Logger logger = LoggerFactory.getLogger(Task.class);
+	
     @GET
     public String sayHelloWorld() {
         return "[task] Echo";
     }   
- 
+    
     @Path("/upload")
     @POST
     @Consumes(MediaType.MULTIPART_FORM_DATA)
     public String upload(FormDataMultiPart part){
     	try{
     		printMultiPart(part);
-    		writeResultToAmq(part);
-    		return toJsonResult("SUCCESS", null, null, null, null);
+    		final String taskId = part.getField("taskId").getValue();
+    		new Thread(()->{
+    				runPseudoProcess(taskId);
+				})
+    			.start();
+    		return toJsonResult(ServiceStatus.SUCCESS, null, null, null, null, null);
     	}
     	catch(Exception ex){
-    		return toJsonResult("FAIL", null, null, null, ex.toString());
+    		ex.printStackTrace();
+    		return toJsonResult(ServiceStatus.FAIL, null, null, null, null, ex.toString());
     	}
     }
     
-    private void writeResultToAmq(FormDataMultiPart part) throws JMSException
+    private void runPseudoProcess(String taskId)
     {
-    	//config
-    	String uri = "failover:(tcp://localhost:61616)?randomize=false";
-    	String queue_name = "csfResult";
-    	
+    	try {
+    		Thread.sleep(1000);
+    		logger.info("process task {}, waiting...", taskId);
+			sendWaitingStatus(taskId);
+
+    		Thread.sleep(30000);
+    		logger.info("process task {}, success...", taskId);
+			sendSuccessStatus(taskId);
+		}
+    	catch (JMSException e) {
+			e.printStackTrace();
+		}
+    	catch(InterruptedException e){
+    		System.out.println("pseudo process is interrupted!");
+			e.printStackTrace();
+    	}
+    }
+
+    private void sendWaitingStatus(String taskId) throws JMSException
+    {
     	//data
-		String taskId = part.getField("taskId").getValue();
-		String[] links = new String[]{
+		JSONObject vnc = new JSONObject();
+		vnc.put("name", "a_vnc");
+		vnc.put("type", "vnc");
+		vnc.put("value", "http://192.168.211.136:7000/vnc_auto.html?password=lablab");
+		vnc.put("desc", "VNC");
+		vnc.put("chtDesc", "VNC\u9023\u7d50");
+
+		String result = toJsonResult(ServiceStatus.WAITING, taskId, null, null, toArray(vnc), null);
+    	sendToAmq(AMQ_URI, AMQ_QUEUE, result);
+    }
+
+    private void sendSuccessStatus(String taskId) throws JMSException
+    {
+    	//data
+		String[] report_links = new String[]{
 				"http://localhost:7080/sample-en.pdf",
 				"http://localhost:7080/sample-cht.pdf"
 		};
-		String result = toJsonResult("SUCCESS", taskId, links, "rawdata", null);
+		String report_data = "rawdata";
 
-		ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(uri);
-		Connection conn = factory.createConnection();
-		conn.start();
-		try{
-			Session session = conn.createSession(false, Session.AUTO_ACKNOWLEDGE);
-			Destination dest = session.createQueue(queue_name);
-			MessageProducer producer = session.createProducer(dest);
-			
-			TextMessage msg = session.createTextMessage();
-			msg.setText(result);
-			producer.send(msg);
-		}
-		finally{
-			conn.close();
-		}
+		JSONObject log = new JSONObject();
+		log.put("name", "a_log");
+		log.put("type", "link");
+		log.put("value", "http://localhost:7080/sample.7z");
+		log.put("desc", "log link");
+		log.put("chtDesc", "日誌連結");
+
+		String result = toJsonResult(ServiceStatus.SUCCESS, taskId, report_links, report_data, toArray(log), null);
+    	sendToAmq(AMQ_URI, AMQ_QUEUE, result);
     }
     
-	public static void printMultiPart(FormDataMultiPart part)
-	{
-			System.out.println(String.format("[%s]", part.getMediaType().toString()));
-			for(Map.Entry<String, List<FormDataBodyPart>> field: part.getFields().entrySet()){
-
-				String key = field.getKey();
-				System.out.println(key);
-
-				List<FormDataBodyPart> vals = field.getValue();
-				for(FormDataBodyPart val: vals)
-					System.out.println(String.format("  [%s]: %s",
-							val.getMediaType().toString(),
-							val.getMediaType().equals(MediaType.TEXT_PLAIN_TYPE)? val.getValue(): "(Not Text)"));
-			}
-	}
-
-    public static String toJsonResult(String status, String taskId, String[] links, String data, String message)
+    private static String toJsonResult(ServiceStatus status, String taskId,
+    		String[] result_links, String result_data,
+    		JSONObject[] args, String message)
     {
 		JSONObject json = new JSONObject();
-		json.put("status", "SUCCESS");
-		if(taskId != null) json.put("taskId", taskId);
+
+		json.put("status", status.toString());
+
+		//task id
+		if(isNotBlank(taskId))
+			json.put("taskId", taskId);
 		
-		if(links != null){
-			if(links.length == 1){
-				json.put("link", links[0]);
-			}
-			else if(links.length > 1){
-				JSONArray links_obj = new JSONArray();
-				for(String link: links)
-					links_obj.put(link);
-				json.put("link", links_obj);
+		//rport links
+		int len = getLength(result_links);
+		if(len == 1){
+			json.put("link", result_links[0]);
+		}
+		else if(len > 1){
+			JSONArray links_obj = new JSONArray();
+			for(String link: result_links)
+				links_obj.put(link);
+			json.put("link", links_obj);
+		}
+		
+		//args
+		if(isNotEmpty(args)){
+			for(JSONObject arg: args){
+				String name = (String)arg.remove("name");
+				json.put(name, arg);
 			}
 		}
 
-		if(data != null) json.put("data", buildResponseMsg(true, "2D6A5CF6EBAC5C13EF76EB99909D77E5", ""));
-		if(message != null) json.put("message", message);
-		
-		//test
-		JSONObject arg = new JSONObject();
-		arg.put("type", "link");
-		arg.put("value", "http://localhost:7080/sample.7z");
-		arg.put("desc", "log link");
-		arg.put("chtDesc", "日誌連結");
-		json.put("a_log", arg);
+		if(isNotBlank(result_data))
+			json.put("data", buildResponseMsg(true, "2D6A5CF6EBAC5C13EF76EB99909D77E5", ""));
 
+		if(isNotBlank(message))
+			json.put("message", message);
+		
 		return json.toString();
     }
     
     //similar as CIA
-    public static JSONObject buildResponseMsg(boolean state, String md5, String ec_msg) throws JSONException{
+    private static JSONObject buildResponseMsg(boolean state, String md5, String ec_msg) throws JSONException{
 		ec_msg = ec_msg.replaceAll("[\\s\"{}:\\\\]+", " "); 
 		md5 = md5.toLowerCase();
 		
